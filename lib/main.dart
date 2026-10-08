@@ -1,221 +1,251 @@
-import 'dart:math';
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
+import 'package:mqtt_client/mqtt_client.dart';
 
-enum ControlCommand { forward, backward, left, right, craneUp, craneDown, craneRotateLeft, craneRotateRight }
-
-void main() => runApp(const CraneRemoteApp());
-
-class CraneRemoteApp extends StatelessWidget {
-  const CraneRemoteApp({super.key});
-  @override
-  Widget build(BuildContext context) => MaterialApp(
-    debugShowCheckedModeBanner: false,
-    title: 'Crane Remote Control',
-    theme: ThemeData(useMaterial3: true, brightness: Brightness.dark,
-      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFFFB300), brightness: Brightness.dark),
-      scaffoldBackgroundColor: const Color(0xFF111820)),
-    home: const RemoteScreen(),
-  );
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
+  runApp(const PS5RemoteApp());
 }
 
-class RemoteScreen extends StatefulWidget {
-  const RemoteScreen({super.key});
-  @override
-  State<RemoteScreen> createState() => _RemoteScreenState();
-}
-
-class _RemoteScreenState extends State<RemoteScreen> {
-  static const String _broker = 'broker.hivemq.com';
-  static const int _port = 8883;
-  final _deviceController = TextEditingController(text: 'car1');
-  late String _clientId;
-  MqttServerClient? _client;
-  Timer? _retryTimer;
-  bool _connected = false;
-  bool _connecting = false;
-  final Map<ControlCommand, String> _activeTopics = {};
-
-  @override
-  void initState() {
-    super.initState();
-    _clientId = _newClientId();
-    _connect();
-    _retryTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (!_connected && !_connecting) _connect();
-    });
-  }
-
-  String _newClientId() => 'crane_${Random.secure().nextInt(1 << 32).toRadixString(16)}';
-
-  String _commandName(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward: return 'forward';
-      case ControlCommand.backward: return 'backward';
-      case ControlCommand.left: return 'left';
-      case ControlCommand.right: return 'right';
-      case ControlCommand.craneUp: return 'crane_up';
-      case ControlCommand.craneDown: return 'crane_down';
-      case ControlCommand.craneRotateLeft: return 'crane_rotate_left';
-      case ControlCommand.craneRotateRight: return 'crane_rotate_right';
-    }
-  }
-
-  String _topic(ControlCommand c) => 'cranecar/${_deviceController.text.trim()}/cmd/${_commandName(c)}';
-
-  Future<void> _connect() async {
-    if (_connecting || !mounted) return;
-    setState(() => _connecting = true);
-    _client?.disconnect();
-    final client = MqttServerClient.withPort(_broker, _clientId, _port);
-    client.secure = true;
-    client.keepAlivePeriod = 30;
-    client.logging(on: false);
-    client.onConnected = () {
-      if (!mounted) return;
-      setState(() { _connected = true; _connecting = false; _activeTopics.clear(); });
-    };
-    client.onDisconnected = () {
-      if (!mounted) return;
-      setState(() { _connected = false; _connecting = false; _activeTopics.clear(); });
-    };
-    client.connectionMessage = MqttConnectMessage().withClientIdentifier(_clientId).startClean().withWillQos(MqttQos.atMostOnce);
-    _client = client;
-    try {
-      await client.connect();
-      if (!mounted) return;
-      setState(() {
-        _connected = client.connectionStatus?.state == MqttConnectionState.connected;
-        _connecting = false;
-      });
-    } catch (_) {
-      client.disconnect();
-      if (!mounted) return;
-      setState(() { _connected = false; _connecting = false; });
-    }
-  }
-
-  void _publish(String topic, String value) {
-    final client = _client;
-    if (!_connected || client == null) return;
-    final payload = MqttClientPayloadBuilder()..addString(value);
-    client.publishMessage(topic, MqttQos.atMostOnce, payload.payload!);
-  }
-
-  void _press(ControlCommand c) {
-    if (_activeTopics.containsKey(c)) return;
-    HapticFeedback.selectionClick();
-    final topic = _topic(c);
-    _activeTopics[c] = topic;
-    _publish(topic, '1');
-  }
-
-  void _release(ControlCommand c) {
-    final topic = _activeTopics.remove(c);
-    if (topic != null) _publish(topic, '0');
-  }
-
-  Future<void> _reconnect() async {
-    if (_connecting) return;
-    final old = _client;
-    _client = null;
-    _connected = false;
-    old?.disconnect();
-    await _connect();
-  }
-
-  Future<void> _newIdAndReconnect() async {
-    setState(() => _clientId = _newClientId());
-    await _reconnect();
-  }
-
-  @override
-  void dispose() {
-    _retryTimer?.cancel();
-    for (final topic in _activeTopics.values.toList()) { _publish(topic, '0'); }
-    _activeTopics.clear();
-    _client?.disconnect();
-    _deviceController.dispose();
-    super.dispose();
-  }
+class PS5RemoteApp extends StatelessWidget {
+  const PS5RemoteApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final statusColor = _connected ? const Color(0xFF35D07F) : const Color(0xFFFF5D5D);
-    return Scaffold(
-      appBar: AppBar(title: const Text('CRANE / CAR REMOTE', style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.1)), centerTitle: true),
-      body: SafeArea(child: Padding(padding: const EdgeInsets.fromLTRB(12, 8, 12, 12), child: Column(children: [
-        Card(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5), child: Column(children: [
-          Row(children: [Icon(Icons.circle, size: 12, color: statusColor), const SizedBox(width: 8), Expanded(child: Text(_connected ? 'Connected · $_broker:$_port (TLS)' : _connecting ? 'Connecting to $_broker…' : 'Disconnected · $_broker:$_port')), IconButton(tooltip: 'Reconnect', onPressed: _connecting ? null : _reconnect, icon: const Icon(Icons.refresh))]),
-          Row(children: [const Icon(Icons.precision_manufacturing_outlined, size: 19), const SizedBox(width: 8), const Text('Device ID'), const SizedBox(width: 8), Expanded(child: TextField(controller: _deviceController, autocorrect: false, decoration: const InputDecoration(isDense: true, hintText: 'must match ESP8266', border: OutlineInputBorder(), contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8))))]),
-          Row(children: [const Icon(Icons.tag, size: 19), const SizedBox(width: 8), const Text('Client ID'), const SizedBox(width: 8), Expanded(child: Text(_clientId, overflow: TextOverflow.ellipsis, style: const TextStyle(fontFamily: 'monospace', fontSize: 12))), IconButton(tooltip: 'Generate client ID and reconnect', onPressed: _connecting ? null : _newIdAndReconnect, icon: const Icon(Icons.shuffle))]),
-        ]))),
-        const Padding(padding: EdgeInsets.symmetric(vertical: 8), child: Text('HOLD A CONTROL TO MOVE · RELEASE TO STOP', style: TextStyle(color: Color(0xFF9EADB8), fontSize: 11, letterSpacing: 1, fontWeight: FontWeight.w700))),
-        Expanded(child: Row(children: [
-          Expanded(child: ControlPad(title: 'DRIVE', icon: Icons.directions_car_filled, accent: const Color(0xFFFFB300), commands: const [ControlCommand.forward, ControlCommand.backward, ControlCommand.left, ControlCommand.right], onPress: _press, onRelease: _release)),
-          const SizedBox(width: 10),
-          Expanded(child: ControlPad(title: 'CRANE ARM', icon: Icons.precision_manufacturing, accent: const Color(0xFF40C4FF), commands: const [ControlCommand.craneUp, ControlCommand.craneDown, ControlCommand.craneRotateLeft, ControlCommand.craneRotateRight], onPress: _press, onRelease: _release)),
-        ])),
-        const SizedBox(height: 6),
-        const Text('ESP8266 subscribes to: cranecar/<device-id>/cmd/#', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFF84939E), fontSize: 11)),
-      ]))),
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: PS5ControllerScreen(),
     );
   }
 }
 
-class ControlPad extends StatelessWidget {
-  const ControlPad({required this.title, required this.icon, required this.accent, required this.commands, required this.onPress, required this.onRelease, super.key});
-  final String title;
-  final IconData icon;
-  final Color accent;
-  final List<ControlCommand> commands;
-  final ValueChanged<ControlCommand> onPress;
-  final ValueChanged<ControlCommand> onRelease;
+class PS5ControllerScreen extends StatefulWidget {
+  const PS5ControllerScreen({super.key});
 
-  String _label(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward: return 'FORWARD';
-      case ControlCommand.backward: return 'BACKWARD';
-      case ControlCommand.left: return 'LEFT';
-      case ControlCommand.right: return 'RIGHT';
-      case ControlCommand.craneUp: return 'UP';
-      case ControlCommand.craneDown: return 'DOWN';
-      case ControlCommand.craneRotateLeft: return 'ROTATE L';
-      case ControlCommand.craneRotateRight: return 'ROTATE R';
-    }
-  }
-  IconData _buttonIcon(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward: case ControlCommand.craneUp: return Icons.arrow_upward;
-      case ControlCommand.backward: case ControlCommand.craneDown: return Icons.arrow_downward;
-      case ControlCommand.left: case ControlCommand.craneRotateLeft: return Icons.arrow_back;
-      case ControlCommand.right: case ControlCommand.craneRotateRight: return Icons.arrow_forward;
-    }
-  }
   @override
-  Widget build(BuildContext context) => Card(color: const Color(0xFF1B252E), clipBehavior: Clip.antiAlias, child: Padding(padding: const EdgeInsets.all(8), child: Column(children: [
-    Row(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(icon, color: accent, size: 19), const SizedBox(width: 6), Text(title, style: TextStyle(color: accent, fontWeight: FontWeight.w800, letterSpacing: 1.2))]),
-    const SizedBox(height: 8),
-    Expanded(child: GridView.count(physics: const NeverScrollableScrollPhysics(), crossAxisCount: 2, mainAxisSpacing: 8, crossAxisSpacing: 8, children: commands.map((c) => _MomentaryButton(label: _label(c), icon: _buttonIcon(c), accent: accent, onDown: () => onPress(c), onUp: () => onRelease(c))).toList())),
-  ])));
+  State<PS5ControllerScreen> createState() => _PS5ControllerScreenState();
 }
 
-class _MomentaryButton extends StatelessWidget {
-  const _MomentaryButton({required this.label, required this.icon, required this.accent, required this.onDown, required this.onUp});
-  final String label;
-  final IconData icon;
-  final Color accent;
-  final VoidCallback onDown;
-  final VoidCallback onUp;
+class _PS5ControllerScreenState extends State<PS5ControllerScreen> {
+  MqttServerClient? client;
+  bool isConnected = false;
+  final String deviceId = 'car1';
+
+  void connectMQTT() async {
+    client = MqttServerClient('broker.hivemq.com', 'ps5_${DateTime.now().millisecondsSinceEpoch}');
+    client!.secure = true;
+    client!.port = 8883;
+    client!.loggingOn = false;
+    try {
+      await client!.connect();
+      setState(() => isConnected = true);
+    } catch (e) {
+      setState(() => isConnected = false);
+    }
+  }
+
+  void send(String cmd, String val) {
+    if (isConnected && client != null) {
+      final builder = MqttClientPayloadBuilder();
+      builder.addString(val);
+      client!.publishMessage('cranecar/$deviceId/cmd/$cmd', MqttQos.atMostOnce, builder.payload!);
+    }
+  }
+
   @override
-  Widget build(BuildContext context) => GestureDetector(
-    behavior: HitTestBehavior.opaque,
-    onTapDown: (_) => onDown(),
-    onTapUp: (_) => onUp(),
-    onTapCancel: onUp,
-    child: DecoratedBox(decoration: BoxDecoration(shape: BoxShape.circle, color: const Color(0xFF26343F), border: Border.all(color: accent.withOpacity(0.75), width: 2), boxShadow: [BoxShadow(color: accent.withOpacity(0.12), blurRadius: 12, spreadRadius: 1)]), child: Center(child: Padding(padding: const EdgeInsets.all(4), child: Column(mainAxisSize: MainAxisSize.min, children: [Icon(icon, color: accent, size: 27), const SizedBox(height: 3), FittedBox(fit: BoxFit.scaleDown, child: Text(label, maxLines: 1, style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w800, letterSpacing: 0.4)))])))),
-  );
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F1015),
+      body: SafeArea(
+        child: Center(
+          child: Container(
+            width: double.infinity,
+            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF0F3F8),
+              borderRadius: BorderRadius.circular(50),
+              border: Border.all(color: Colors.blueAccent.withOpacity(0.5), width: 3),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.blueAccent.withOpacity(0.2),
+                  blurRadius: 25,
+                  spreadRadius: 5,
+                )
+              ],
+            ),
+            child: Stack(
+              children: [
+                // Top Touchpad Area (PS5 Style)
+                Align(
+                  alignment: Alignment.topCenter,
+                  child: Container(
+                    margin: const EdgeInsets.only(top: 10),
+                    width: 220,
+                    height: 85,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E212B),
+                      borderRadius: const BorderRadius.vertical(bottom: Radius.circular(25), top: Radius.circular(10)),
+                      border: Border.all(
+                        color: isConnected ? Colors.cyanAccent : Colors.grey.shade700,
+                        width: 2,
+                      ),
+                      boxShadow: isConnected
+                          ? [BoxShadow(color: Colors.cyanAccent.withOpacity(0.4), blurRadius: 10)]
+                          : [],
+                    ),
+                    child: InkWell(
+                      onTap: connectMQTT,
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            isConnected ? Icons.wifi : Icons.wifi_off,
+                            color: isConnected ? Colors.cyanAccent : Colors.white54,
+                            size: 26,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            isConnected ? "PS5 ONLINE (car1)" : "TAP TO CONNECT",
+                            style: TextStyle(
+                              color: isConnected ? Colors.cyanAccent : Colors.white70,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+                // Left D-Pad
+                Positioned(
+                  left: 35,
+                  top: 45,
+                  child: Column(
+                    children: [
+                      _dpadBtn(Icons.arrow_drop_up, 'y', '100'),
+                      Row(
+                        children: [
+                          _dpadBtn(Icons.arrow_left, 'x', '-100'),
+                          const SizedBox(width: 35),
+                          _dpadBtn(Icons.arrow_right, 'x', '100'),
+                        ],
+                      ),
+                      _dpadBtn(Icons.arrow_drop_down, 'y', '-100'),
+                    ],
+                  ),
+                ),
+
+                // Right PS Action Buttons
+                Positioned(
+                  right: 35,
+                  top: 45,
+                  child: Column(
+                    children: [
+                      _actionBtn('▲', Colors.greenAccent, 'c', '100'),
+                      Row(
+                        children: [
+                          _actionBtn('■', Colors.pinkAccent, 'r', '-100'),
+                          const SizedBox(width: 35),
+                          _actionBtn('●', Colors.redAccent, 'r', '100'),
+                        ],
+                      ),
+                      _actionBtn('✖', Colors.lightBlueAccent, 'c', '-100'),
+                    ],
+                  ),
+                ),
+
+                // Left Stick
+                Positioned(
+                  bottom: 20,
+                  left: 170,
+                  child: _analogStick("DRIVE"),
+                ),
+
+                // Right Stick
+                Positioned(
+                  bottom: 20,
+                  right: 170,
+                  child: _analogStick("CRANE"),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _dpadBtn(IconData icon, String cmd, String val) {
+    return GestureDetector(
+      onTapDown: (_) => send(cmd, val),
+      onTapUp: (_) => send(cmd, '0'),
+      child: Container(
+        width: 42,
+        height: 42,
+        decoration: BoxDecoration(
+          color: const Color(0xFF2B303C),
+          borderRadius: BorderRadius.circular(10),
+          boxShadow: const [BoxShadow(color: Colors.black38, blurRadius: 4, offset: Offset(0, 3))],
+        ),
+        child: Icon(icon, color: Colors.white, size: 28),
+      ),
+    );
+  }
+
+  Widget _actionBtn(String label, Color color, String cmd, String val) {
+    return GestureDetector(
+      onTapDown: (_) => send(cmd, val),
+      onTapUp: (_) => send(cmd, '0'),
+      child: Container(
+        width: 42,
+        height: 42,
+        decoration: BoxDecoration(
+          color: const Color(0xFF2B303C),
+          shape: BoxShape.circle,
+          boxShadow: const [BoxShadow(color: Colors.black38, blurRadius: 4, offset: Offset(0, 3))],
+        ),
+        child: Center(
+          child: Text(label, style: TextStyle(color: color, fontSize: 18, fontWeight: FontWeight.bold)),
+        ),
+      ),
+    );
+  }
+
+  Widget _analogStick(String label) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 75,
+          height: 75,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: const RadialGradient(
+              colors: [Color(0xFF434A59), Color(0xFF1B1E26)],
+            ),
+            border: Border.all(color: Colors.grey.shade400, width: 2),
+            boxShadow: const [BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 4))],
+          ),
+          child: const Center(
+            child: CircleAvatar(
+              radius: 18,
+              backgroundColor: Color(0xFF111317),
+            ),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Color(0xFF333D4B)),
+        ),
+      ],
+    );
+  }
 }
