@@ -1,25 +1,26 @@
-import 'dart:math';
 import 'dart:async';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 
-enum ControlCommand { forward, backward, left, right, craneUp, craneDown, craneRotateLeft, craneRotateRight }
+void main() => runApp(const CraneApp());
 
-void main() => runApp(const CraneRemoteApp());
+const kBroker = 'broker.hivemq.com';
+const kPort = 8883;
 
-class CraneRemoteApp extends StatelessWidget {
-  const CraneRemoteApp({super.key});
+class CraneApp extends StatelessWidget {
+  const CraneApp({super.key});
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    debugShowCheckedModeBanner: false,
-    title: 'Crane Remote Control',
-    theme: ThemeData(useMaterial3: true, brightness: Brightness.dark,
-      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFFFB300), brightness: Brightness.dark),
-      scaffoldBackgroundColor: const Color(0xFF111820)),
-    home: const RemoteScreen(),
-  );
+  Widget build(BuildContext context) {
+    SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(fontFamily: 'Roboto', useMaterial3: true),
+      home: const RemoteScreen(),
+    );
+  }
 }
 
 class RemoteScreen extends StatefulWidget {
@@ -29,193 +30,205 @@ class RemoteScreen extends StatefulWidget {
 }
 
 class _RemoteScreenState extends State<RemoteScreen> {
-  static const String _broker = 'broker.hivemq.com';
-  static const int _port = 8883;
-  final _deviceController = TextEditingController(text: 'car1');
-  late String _clientId;
-  MqttServerClient? _client;
-  Timer? _retryTimer;
-  bool _connected = false;
-  bool _connecting = false;
-  final Map<ControlCommand, String> _activeTopics = {};
+  MqttServerClient? client;
+  bool connected = false;
+  String device = 'esp8266';
+  Timer? pubTimer;
+  final Map<String, String> state = {'x': '0', 'y': '0', 'c': '0', 'r': '0'};
 
-  @override
-  void initState() {
-    super.initState();
-    _clientId = _newClientId();
-    _connect();
-    _retryTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (!_connected && !_connecting) _connect();
-    });
-  }
-
-  String _newClientId() => 'crane_${Random.secure().nextInt(1 << 32).toRadixString(16)}';
-
-  String _commandName(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward: return 'forward';
-      case ControlCommand.backward: return 'backward';
-      case ControlCommand.left: return 'left';
-      case ControlCommand.right: return 'right';
-      case ControlCommand.craneUp: return 'crane_up';
-      case ControlCommand.craneDown: return 'crane_down';
-      case ControlCommand.craneRotateLeft: return 'crane_rotate_left';
-      case ControlCommand.craneRotateRight: return 'crane_rotate_right';
-    }
-  }
-
-  String _topic(ControlCommand c) => 'cranecar/${_deviceController.text.trim()}/cmd/${_commandName(c)}';
-
-  Future<void> _connect() async {
-    if (_connecting || !mounted) return;
-    setState(() => _connecting = true);
-    _client?.disconnect();
-    final client = MqttServerClient.withPort(_broker, _clientId, _port);
-    client.secure = true;
-    client.keepAlivePeriod = 30;
-    client.logging(on: false);
-    client.onConnected = () {
-      if (!mounted) return;
-      setState(() { _connected = true; _connecting = false; _activeTopics.clear(); });
-    };
-    client.onDisconnected = () {
-      if (!mounted) return;
-      setState(() { _connected = false; _connecting = false; _activeTopics.clear(); });
-    };
-    client.connectionMessage = MqttConnectMessage().withClientIdentifier(_clientId).startClean().withWillQos(MqttQos.atMostOnce);
-    _client = client;
+  Future<void> connect() async {
+    final c = MqttServerClient(kBroker, 'crane_${DateTime.now().millisecondsSinceEpoch}');
+    c.port = kPort;
+    c.secure = true;
+    c.loggingOn = false;
+    c.onConnected = () => setState(() => connected = true);
+    c.onDisconnected = () => setState(() => connected = false);
     try {
-      await client.connect();
-      if (!mounted) return;
-      setState(() {
-        _connected = client.connectionStatus?.state == MqttConnectionState.connected;
-        _connecting = false;
-      });
+      await c.connect();
+      c.subscribe('#');
     } catch (_) {
-      client.disconnect();
-      if (!mounted) return;
-      setState(() { _connected = false; _connecting = false; });
+      setState(() => connected = false);
     }
   }
 
-  void _publish(String topic, String value) {
-    final client = _client;
-    if (!_connected || client == null) return;
-    final payload = MqttClientPayloadBuilder()..addString(value);
-    client.publishMessage(topic, MqttQos.atMostOnce, payload.payload!);
+  void send(String topic, String val) {
+    if (state[topic] == val) return;
+    state[topic] = val;
+    final c = client;
+    if (c == null || !connected) return;
+    final b = MqttClientPayloadBuilder();
+    b.addString(val);
+    c.publishMessage('cranecar/$device/cmd/$topic', MqttQos.atMostOnce, b.payload!);
   }
 
-  void _press(ControlCommand c) {
-    if (_activeTopics.containsKey(c)) return;
-    HapticFeedback.selectionClick();
-    final topic = _topic(c);
-    _activeTopics[c] = topic;
-    _publish(topic, '1');
-  }
-
-  void _release(ControlCommand c) {
-    final topic = _activeTopics.remove(c);
-    if (topic != null) _publish(topic, '0');
-  }
-
-  Future<void> _reconnect() async {
-    if (_connecting) return;
-    final old = _client;
-    _client = null;
-    _connected = false;
-    old?.disconnect();
-    await _connect();
-  }
-
-  Future<void> _newIdAndReconnect() async {
-    setState(() => _clientId = _newClientId());
-    await _reconnect();
-  }
-
-  @override
-  void dispose() {
-    _retryTimer?.cancel();
-    for (final topic in _activeTopics.values.toList()) { _publish(topic, '0'); }
-    _activeTopics.clear();
-    _client?.disconnect();
-    _deviceController.dispose();
-    super.dispose();
+  void stopAll() {
+    for (final t in ['x', 'y', 'c', 'r']) {
+      state[t] = '0';
+      send(t, '0');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final statusColor = _connected ? const Color(0xFF35D07F) : const Color(0xFFFF5D5D);
     return Scaffold(
-      appBar: AppBar(title: const Text('CRANE / CAR REMOTE', style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.1)), centerTitle: true),
-      body: SafeArea(child: Padding(padding: const EdgeInsets.fromLTRB(12, 8, 12, 12), child: Column(children: [
-        Card(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5), child: Column(children: [
-          Row(children: [Icon(Icons.circle, size: 12, color: statusColor), const SizedBox(width: 8), Expanded(child: Text(_connected ? 'Connected · $_broker:$_port (TLS)' : _connecting ? 'Connecting to $_broker…' : 'Disconnected · $_broker:$_port')), IconButton(tooltip: 'Reconnect', onPressed: _connecting ? null : _reconnect, icon: const Icon(Icons.refresh))]),
-          Row(children: [const Icon(Icons.precision_manufacturing_outlined, size: 19), const SizedBox(width: 8), const Text('Device ID'), const SizedBox(width: 8), Expanded(child: TextField(controller: _deviceController, autocorrect: false, decoration: const InputDecoration(isDense: true, hintText: 'must match ESP8266', border: OutlineInputBorder(), contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8))))]),
-          Row(children: [const Icon(Icons.tag, size: 19), const SizedBox(width: 8), const Text('Client ID'), const SizedBox(width: 8), Expanded(child: Text(_clientId, overflow: TextOverflow.ellipsis, style: const TextStyle(fontFamily: 'monospace', fontSize: 12))), IconButton(tooltip: 'Generate client ID and reconnect', onPressed: _connecting ? null : _newIdAndReconnect, icon: const Icon(Icons.shuffle))]),
-        ]))),
-        const Padding(padding: EdgeInsets.symmetric(vertical: 8), child: Text('HOLD A CONTROL TO MOVE · RELEASE TO STOP', style: TextStyle(color: Color(0xFF9EADB8), fontSize: 11, letterSpacing: 1, fontWeight: FontWeight.w700))),
-        Expanded(child: Row(children: [
-          Expanded(child: ControlPad(title: 'DRIVE', icon: Icons.directions_car_filled, accent: const Color(0xFFFFB300), commands: const [ControlCommand.forward, ControlCommand.backward, ControlCommand.left, ControlCommand.right], onPress: _press, onRelease: _release)),
-          const SizedBox(width: 10),
-          Expanded(child: ControlPad(title: 'CRANE ARM', icon: Icons.precision_manufacturing, accent: const Color(0xFF40C4FF), commands: const [ControlCommand.craneUp, ControlCommand.craneDown, ControlCommand.craneRotateLeft, ControlCommand.craneRotateRight], onPress: _press, onRelease: _release)),
-        ])),
-        const SizedBox(height: 6),
-        const Text('ESP8266 subscribes to: cranecar/<device-id>/cmd/#', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFF84939E), fontSize: 11)),
-      ]))),
+      backgroundColor: const Color(0xFFE8ECF2),
+      body: SafeArea(
+        child: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter,
+              colors: [Color(0xFFF7F9FC), Color(0xFFDDE4EE)]),
+          ),
+          child: Column(children: [
+            _topBar(),
+            Expanded(child: Row(children: [
+              Expanded(child: _side(left: true)),
+              Expanded(child: _center()),
+              Expanded(child: _side(left: false)),
+            ])),
+          ]),
+        ),
+      ),
     );
   }
-}
 
-class ControlPad extends StatelessWidget {
-  const ControlPad({required this.title, required this.icon, required this.accent, required this.commands, required this.onPress, required this.onRelease, super.key});
-  final String title;
-  final IconData icon;
-  final Color accent;
-  final List<ControlCommand> commands;
-  final ValueChanged<ControlCommand> onPress;
-  final ValueChanged<ControlCommand> onRelease;
-
-  String _label(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward: return 'FORWARD';
-      case ControlCommand.backward: return 'BACKWARD';
-      case ControlCommand.left: return 'LEFT';
-      case ControlCommand.right: return 'RIGHT';
-      case ControlCommand.craneUp: return 'UP';
-      case ControlCommand.craneDown: return 'DOWN';
-      case ControlCommand.craneRotateLeft: return 'ROTATE L';
-      case ControlCommand.craneRotateRight: return 'ROTATE R';
-    }
-  }
-  IconData _buttonIcon(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward: case ControlCommand.craneUp: return Icons.arrow_upward;
-      case ControlCommand.backward: case ControlCommand.craneDown: return Icons.arrow_downward;
-      case ControlCommand.left: case ControlCommand.craneRotateLeft: return Icons.arrow_back;
-      case ControlCommand.right: case ControlCommand.craneRotateRight: return Icons.arrow_forward;
-    }
-  }
-  @override
-  Widget build(BuildContext context) => Card(color: const Color(0xFF1B252E), clipBehavior: Clip.antiAlias, child: Padding(padding: const EdgeInsets.all(8), child: Column(children: [
-    Row(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(icon, color: accent, size: 19), const SizedBox(width: 6), Text(title, style: TextStyle(color: accent, fontWeight: FontWeight.w800, letterSpacing: 1.2))]),
-    const SizedBox(height: 8),
-    Expanded(child: GridView.count(physics: const NeverScrollableScrollPhysics(), crossAxisCount: 2, mainAxisSpacing: 8, crossAxisSpacing: 8, children: commands.map((c) => _MomentaryButton(label: _label(c), icon: _buttonIcon(c), accent: accent, onDown: () => onPress(c), onUp: () => onRelease(c))).toList())),
-  ])));
-}
-
-class _MomentaryButton extends StatelessWidget {
-  const _MomentaryButton({required this.label, required this.icon, required this.accent, required this.onDown, required this.onUp});
-  final String label;
-  final IconData icon;
-  final Color accent;
-  final VoidCallback onDown;
-  final VoidCallback onUp;
-  @override
-  Widget build(BuildContext context) => GestureDetector(
-    behavior: HitTestBehavior.opaque,
-    onTapDown: (_) => onDown(),
-    onTapUp: (_) => onUp(),
-    onTapCancel: onUp,
-    child: DecoratedBox(decoration: BoxDecoration(shape: BoxShape.circle, color: const Color(0xFF26343F), border: Border.all(color: accent.withOpacity(0.75), width: 2), boxShadow: [BoxShadow(color: accent.withOpacity(0.12), blurRadius: 12, spreadRadius: 1)]), child: Center(child: Padding(padding: const EdgeInsets.all(4), child: Column(mainAxisSize: MainAxisSize.min, children: [Icon(icon, color: accent, size: 27), const SizedBox(height: 3), FittedBox(fit: BoxFit.scaleDown, child: Text(label, maxLines: 1, style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w800, letterSpacing: 0.4)))])))),
+  Widget _topBar() => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+    child: Row(children: [
+      _lampDot(connected),
+      const SizedBox(width: 6),
+      _lampDot(connected),
+      const Spacer(),
+      Text(connected ? 'CONNECTED' : 'TAP TO CONNECT',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12,
+              color: connected ? Colors.blue.shade700 : Colors.grey)),
+      const SizedBox(width: 12),
+      GestureDetector(
+        onTap: () { if (!connected) connect(); else stopAll(); },
+        child: Icon(connected ? Icons.power_settings_new : Icons.bluetooth_searching,
+            color: connected ? Colors.blue.shade700 : Colors.blueGrey),
+      ),
+    ]),
   );
+
+  Widget _lampDot(bool on) => Container(
+    width: 14, height: 14,
+    decoration: BoxDecoration(shape: BoxShape.circle,
+      color: on ? Colors.lightBlue : Colors.grey.shade400,
+      boxShadow: on ? [BoxShadow(color: Colors.lightBlue.withOpacity(.8), blurRadius: 8, spreadRadius: 1)] : []),
+  );
+
+  Widget _side({required bool left}) => Center(
+    child: Joystick3D(
+      color: left ? Colors.blue.shade700 : Colors.blue.shade500,
+      label: left ? 'CAR' : 'CRANE',
+      onMove: (dx, dy) {
+        if (left) { send('x', dx.round().toString()); send('y', (-dy).round().toString()); }
+        else { send('c', (-dy).round().toString()); send('r', dx.round().toString()); }
+      },
+    ),
+  );
+
+  Widget _center() => Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+      _padBtn('▲', 'fwd'), _padBtn('▼', 'bwd'),
+    ]),
+    const SizedBox(height: 8),
+    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+      _shapeBtn('△', Colors.green.shade600, 'horn'),
+      const SizedBox(width: 8),
+      _shapeBtn('✕', Colors.red.shade600, 'stop'),
+    ]),
+  ]);
+
+  Widget _padBtn(String icon, String cmd) => GestureDetector(
+    onLongPressStart: (_) => send(icon == '▲' ? 'x' : 'y', icon == '▲' ? '100' : '-100'),
+    onLongPressEnd: (_) => stopAll(),
+    child: Container(
+      margin: const EdgeInsets.symmetric(horizontal: 6),
+      width: 56, height: 44,
+      decoration: BoxDecoration(
+        color: const Color(0xFF20242E),
+        borderRadius: BorderRadius.circular(10),
+        boxShadow: const [BoxShadow(color: Colors.black26, offset: Offset(0, 3), blurRadius: 6)],
+      ),
+      child: Center(child: Text(icon, style: const TextStyle(color: Colors.white, fontSize: 18))),
+    ),
+  );
+
+  Widget _shapeBtn(String symbol, Color color, String cmd) => GestureDetector(
+    onTapDown: (_) => send(cmd, '1'),
+    onTapUp: (_) => send(cmd, '0'),
+    child: Container(
+      width: 48, height: 48,
+      decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFF20242E),
+        boxShadow: [BoxShadow(color: Colors.black26, offset: Offset(0, 3), blurRadius: 6)]),
+      child: Center(child: Text(symbol, style: TextStyle(color: color, fontSize: 24, fontWeight: FontWeight.bold))),
+    ),
+  );
+}
+
+// ---------- 3D Joystick ----------
+class Joystick3D extends StatefulWidget {
+  final Color color;
+  final String label;
+  final void Function(double dx, double dy) onMove;
+  const Joystick3D({super.key, required this.color, required this.label, required this.onMove});
+  @override
+  State<Joystick3D> createState() => _Joystick3DState();
+}
+
+class _Joystick3DState extends State<Joystick3D> {
+  Offset offset = Offset.zero;
+  static const r = 52.0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      Text(widget.label, style: TextStyle(fontWeight: FontWeight.bold, color: widget.color, fontSize: 13)),
+      const SizedBox(height: 8),
+      Listener(
+        onPointerDown: (_) {},
+        onPointerMove: (e) => _update(e.localPosition),
+        onPointerUp: (_) {
+          setState(() => offset = Offset.zero);
+          widget.onMove(0, 0);
+        },
+        child: GestureDetector(
+          onPanUpdate: (d) => _update(d.localPosition),
+          child: Container(
+            width: 150, height: 150,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: const RadialGradient(colors: [Color(0xFFF2F5FA), Color(0xFFCBD3E0)]),
+              boxShadow: [BoxShadow(color: Colors.grey.shade500.withOpacity(.5), offset: const Offset(0, 6), blurRadius: 12)],
+              border: Border.all(color: Colors.white, width: 2),
+            ),
+            child: Stack(alignment: Alignment.center, children: [
+              // knob with 3D shadow
+              Positioned(
+                left: 75 - r + offset.dx, top: 75 - r + offset.dy,
+                child: Container(
+                  width: r * 2, height: r * 2,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: RadialGradient(colors: [Colors.white, widget.color.withOpacity(.85)]),
+                    boxShadow: [BoxShadow(color: widget.color.withOpacity(.45), offset: const Offset(0, 5), blurRadius: 10)],
+                  ),
+                ),
+              ),
+            ]),
+          ),
+        ),
+      ),
+    ]);
+  }
+
+  void _update(Offset p) {
+    final c = const Offset(75, 75);
+    var v = p - c;
+    final len = v.distance;
+    if (len > 58) v = v / len * 58;
+    setState(() => offset = v);
+    widget.onMove((v.dx / 58 * 100).clamp(-100, 100).toDouble(), (v.dy / 58 * 100).clamp(-100, 100).toDouble());
+  }
 }
