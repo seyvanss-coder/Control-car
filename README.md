@@ -25,4 +25,4 @@ invert motor polarity if its wiring uses opposite directions.
 The app sends updated commands while dragging and repeats nonzero joystick
 commands every 150 ms. Releasing/cancelling a stick, emergency stop, disconnect,
 or app pause sends zero commands (when connected). Each joystick accepts a
-single active pointer and ignores other fingers.
+single active pointer and ignores other fingers
