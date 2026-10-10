@@ -1,25 +1,18 @@
-
 import 'dart:async';
-import 'dart:math';
+import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 
-enum ControlCommand {
-  forward,
-  backward,
-  left,
-  right,
-  craneUp,
-  craneDown,
-  craneRotateLeft,
-  craneRotateRight,
-}
-
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations(const [
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
   runApp(const CraneRemoteApp());
 }
 
@@ -27,523 +20,261 @@ class CraneRemoteApp extends StatelessWidget {
   const CraneRemoteApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    const gold = Color(0xFFFFB300);
-
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Crane Remote',
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.dark,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: gold,
+  Widget build(BuildContext context) => MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
           brightness: Brightness.dark,
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xFF17C9B5),
+            brightness: Brightness.dark,
+          ),
+          scaffoldBackgroundColor: const Color(0xFF101820),
+          useMaterial3: true,
         ),
-        scaffoldBackgroundColor: const Color(0xFF0B1118),
-        cardColor: const Color(0xFF151F2A),
-      ),
-      home: const RemoteScreen(),
-    );
-  }
+        home: const RemotePage(),
+      );
 }
 
-class RemoteScreen extends StatefulWidget {
-  const RemoteScreen({super.key});
+class RemotePage extends StatefulWidget {
+  const RemotePage({super.key});
 
   @override
-  State<RemoteScreen> createState() => _RemoteScreenState();
+  State<RemotePage> createState() => _RemotePageState();
 }
 
-class _RemoteScreenState extends State<RemoteScreen>
-    with WidgetsBindingObserver {
-  static const String _broker = 'broker.hivemq.com';
+class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
+  static const String _host = 'broker.hivemq.com';
   static const int _port = 8883;
+  static const String _deviceId = 'car1';
+  static const String _driveTopic = 'cranecar/car1/cmd/drive';
+  static const String _craneTopic = 'cranecar/car1/cmd/crane';
 
-  final _deviceController = TextEditingController(text: 'car1');
-
-  late String _clientId;
   MqttServerClient? _client;
-  Timer? _retryTimer;
-
+  Timer? _publishTimer;
   bool _connected = false;
   bool _connecting = false;
-  bool _disposed = false;
-
-  final Map<ControlCommand, String> _activeTopics = {};
+  String? _error;
+  double _driveX = 0;
+  double _driveY = 0;
+  double _craneX = 0;
+  double _craneY = 0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-
-    _clientId = _newClientId();
-    _connect();
-
-    _retryTimer = Timer.periodic(
-      const Duration(seconds: 15),
-      (_) {
-        if (!_connected && !_connecting && !_disposed) {
-          _connect();
-        }
-      },
-    );
-  }
-
-  String _newClientId() =>
-      'crane_${Random.secure().nextInt(1 << 32).toRadixString(16)}';
-
-  String _commandName(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward:
-        return 'forward';
-      case ControlCommand.backward:
-        return 'backward';
-      case ControlCommand.left:
-        return 'left';
-      case ControlCommand.right:
-        return 'right';
-      case ControlCommand.craneUp:
-        return 'crane_up';
-      case ControlCommand.craneDown:
-        return 'crane_down';
-      case ControlCommand.craneRotateLeft:
-        return 'crane_rotate_left';
-      case ControlCommand.craneRotateRight:
-        return 'crane_rotate_right';
-    }
-  }
-
-  String _topic(ControlCommand c) {
-    final id = _deviceController.text.trim();
-
-    if (id.isEmpty || id.contains('/')) {
-      throw ArgumentError('Device ID is invalid');
-    }
-
-    return 'cranecar/$id/cmd/${_commandName(c)}';
-  }
-
-  Future<void> _connect() async {
-    if (_connecting || _disposed) return;
-
-    _connecting = true;
-    if (mounted) setState(() {});
-
-    final previous = _client;
-    _client = null;
-    previous?.disconnect();
-
-    final client = MqttServerClient.withPort(
-      _broker,
-      _clientId,
-      _port,
-    );
-
-    client.secure = true;
-    client.keepAlivePeriod = 30;
-    client.connectTimeoutPeriod = 8000;
-    client.logging(on: false);
-
-    client.onConnected = () {
-      if (_disposed || !identical(_client, client)) return;
-
-      if (mounted) {
-        setState(() {
-          _connected = true;
-          _connecting = false;
-        });
-      }
-    };
-
-    client.onDisconnected = () {
-      if (_disposed || !identical(_client, client)) return;
-
-      _activeTopics.clear();
-
-      if (mounted) {
-        setState(() {
-          _connected = false;
-          _connecting = false;
-        });
-      }
-    };
-
-    client.connectionMessage = MqttConnectMessage()
-        .withClientIdentifier(_clientId)
-        .startClean()
-        .withWillQos(MqttQos.atMostOnce);
-
-    _client = client;
-
-    try {
-      final status = await client.connect();
-
-      if (_disposed || !identical(_client, client)) return;
-
-      final success =
-          status?.state == MqttConnectionState.connected;
-
-      if (!success) {
-        client.disconnect();
-      }
-
-      if (mounted) {
-        setState(() {
-          _connected = success;
-          _connecting = false;
-        });
-      }
-    } catch (_) {
-      client.disconnect();
-
-      if (_disposed || !identical(_client, client)) return;
-
-      if (mounted) {
-        setState(() {
-          _connected = false;
-          _connecting = false;
-        });
-      }
-    }
-  }
-
-  bool _publish(String topic, String value) {
-    final client = _client;
-
-    if (!_connected ||
-        client == null ||
-        client.connectionStatus?.state !=
-            MqttConnectionState.connected) {
-      return false;
-    }
-
-    try {
-      final builder = MqttClientPayloadBuilder()
-        ..addString(value);
-
-      final payload = builder.payload;
-      if (payload == null) return false;
-
-      client.publishMessage(
-        topic,
-        MqttQos.atMostOnce,
-        payload,
-        retain: false,
-      );
-
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  void _press(ControlCommand command) {
-    if (!_connected || _activeTopics.containsKey(command)) {
-      return;
-    }
-
-    try {
-      final topic = _topic(command);
-
-      if (_publish(topic, '1')) {
-        _activeTopics[command] = topic;
-        HapticFeedback.selectionClick();
-        if (mounted) setState(() {});
-      }
-    } catch (_) {
-      _showMessage('شناسه دستگاه معتبر نیست.');
-    }
-  }
-
-  void _release(ControlCommand command) {
-    final topic = _activeTopics.remove(command);
-    if (topic == null) return;
-
-    _publish(topic, '0');
-
-    if (mounted) setState(() {});
-  }
-
-  void _releaseAll() {
-    final topics = _activeTopics.values.toList();
-    _activeTopics.clear();
-
-    for (final topic in topics) {
-      _publish(topic, '0');
-    }
-
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _reconnect() async {
-    if (_connecting || _disposed) return;
-
-    _releaseAll();
-
-    final old = _client;
-    _client = null;
-    _connected = false;
-    _connecting = false;
-
-    old?.disconnect();
-
-    await _connect();
-  }
-
-  Future<void> _applyDeviceId() async {
-    final id = _deviceController.text.trim();
-
-    if (id.isEmpty || id.contains('/')) {
-      _showMessage('شناسه دستگاه معتبر نیست.');
-      return;
-    }
-
-    await _reconnect();
-  }
-
-  Future<void> _newIdAndReconnect() async {
-    if (_connecting) return;
-
-    _clientId = _newClientId();
-    if (mounted) setState(() {});
-
-    await _reconnect();
-  }
-
-  void _showMessage(String message) {
-    if (!mounted) return;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
+    _publishTimer = Timer.periodic(const Duration(milliseconds: 150), (_) {
+      if (!_connected) return;
+      if (_driveX != 0 || _driveY != 0) _publishDrive();
+      if (_craneX != 0 || _craneY != 0) _publishCrane();
+    });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) {
-      _releaseAll();
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _stopAll(sendZeros: true);
     }
+  }
+
+  Future<void> _connect() async {
+    if (_connecting || _connected) return;
+    setState(() {
+      _connecting = true;
+      _error = null;
+    });
+
+    final client = MqttServerClient.withPort(_host, _deviceId, _port);
+    client
+      ..secure = true
+      ..keepAlivePeriod = 20
+      ..connectTimeoutPeriod = 10000
+      ..logging(on: false)
+      ..onConnected = () {
+        if (!mounted) return;
+        setState(() {
+          _connected = true;
+          _connecting = false;
+          _error = null;
+        });
+      }
+      ..onDisconnected = () {
+        if (!mounted) return;
+        setState(() {
+          _connected = false;
+          _connecting = false;
+        });
+      };
+    client.connectionMessage = MqttConnectMessage()
+        .withClientIdentifier(_deviceId)
+        .startClean()
+        .withWillQos(MqttQos.atLeastOnce);
+    _client = client;
+
+    try {
+      final status = await client.connect();
+      if (status?.state == MqttConnectionState.connected) {
+        if (mounted) {
+          setState(() {
+            _connected = true;
+            _connecting = false;
+          });
+        }
+      } else {
+        client.disconnect();
+        if (mounted) {
+          setState(() {
+            _connected = false;
+            _connecting = false;
+            _error = 'اتصال برقرار نشد؛ وضعیت بروکر را بررسی کنید.';
+          });
+        }
+      }
+    } catch (e) {
+      client.disconnect();
+      if (mounted) {
+        setState(() {
+          _connected = false;
+          _connecting = false;
+          _error = 'خطای اتصال: $e';
+        });
+      }
+    }
+  }
+
+  Future<void> _disconnect() async {
+    _stopAll(sendZeros: true);
+    final client = _client;
+    _client = null;
+    client?.disconnect();
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _connecting = false;
+      });
+    }
+  }
+
+  void _stopAll({required bool sendZeros}) {
+    if (sendZeros) {
+      _publishDriveValues(0, 0);
+      _publishCraneValues(0, 0);
+    }
+    _driveX = 0;
+    _driveY = 0;
+    _craneX = 0;
+    _craneY = 0;
+    if (mounted) setState(() {});
+  }
+
+  void _publish(String topic, String payload) {
+    final client = _client;
+    if (!_connected || client == null ||
+        client.connectionStatus?.state != MqttConnectionState.connected) {
+      return;
+    }
+    final builder = MqttClientPayloadBuilder()..addString(payload);
+    final data = builder.payload;
+    if (data != null) {
+      client.publishMessage(topic, MqttQos.atMostOnce, data);
+    }
+  }
+
+  int _bounded(int value) => value.clamp(-255, 255).toInt();
+
+  void _publishDriveValues(double x, double y) {
+    // Up is forward; right stick deflection turns right. Differential mix:
+    // left = throttle + turn, right = throttle - turn, independently clamped.
+    final throttle = y * 255;
+    final turn = x * 255;
+    final left = _bounded((throttle + turn).round());
+    final right = _bounded((throttle - turn).round());
+    _publish(_driveTopic, jsonEncode({'left': left, 'right': right}));
+  }
+
+  void _publishCraneValues(double x, double y) {
+    final lift = _bounded((y * 255).round());
+    final rotate = _bounded((x * 255).round());
+    _publish(_craneTopic, jsonEncode({'lift': lift, 'rotate': rotate}));
+  }
+
+  void _publishDrive() => _publishDriveValues(_driveX, _driveY);
+  void _publishCrane() => _publishCraneValues(_craneX, _craneY);
+
+  void _updateDrive(double x, double y) {
+    _driveX = x;
+    _driveY = y;
+    _publishDrive();
+  }
+
+  void _endDrive() {
+    _driveX = 0;
+    _driveY = 0;
+    _publishDriveValues(0, 0);
+  }
+
+  void _updateCrane(double x, double y) {
+    _craneX = x;
+    _craneY = y;
+    _publishCrane();
+  }
+
+  void _endCrane() {
+    _craneX = 0;
+    _craneY = 0;
+    _publishCraneValues(0, 0);
   }
 
   @override
   void dispose() {
-    _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
-    _retryTimer?.cancel();
-
-    for (final topic in _activeTopics.values.toList()) {
-      _publish(topic, '0');
-    }
-
-    _activeTopics.clear();
+    _publishTimer?.cancel();
+    // Best effort safety zeros before closing the network connection.
+    _publishDriveValues(0, 0);
+    _publishCraneValues(0, 0);
     _client?.disconnect();
-    _deviceController.dispose();
-
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    const gold = Color(0xFFFFB300);
-    const blue = Color(0xFF40C4FF);
-
-    final statusColor = _connected
-        ? const Color(0xFF35D07F)
-        : const Color(0xFFFF5D5D);
-
     return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'CRANE / CAR',
-          style: TextStyle(
-            fontWeight: FontWeight.w900,
-            letterSpacing: 2,
-          ),
-        ),
-        centerTitle: true,
-        actions: [
-          IconButton(
-            tooltip: 'Reconnect',
-            onPressed: _connecting ? null : _reconnect,
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(12),
+          padding: const EdgeInsets.fromLTRB(14, 8, 14, 10),
           child: Column(
             children: [
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF151F2A),
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(
-                    color: statusColor.withOpacity(0.5),
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.circle,
-                          size: 12,
-                          color: statusColor,
-                        ),
-                        const SizedBox(width: 9),
-                        Expanded(
-                          child: Text(
-                            _connected
-                                ? 'MQTT CONNECTED'
-                                : _connecting
-                                    ? 'CONNECTING...'
-                                    : 'DISCONNECTED',
-                            style: TextStyle(
-                              color: statusColor,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                        const Icon(Icons.wifi, color: gold),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-                    TextField(
-                      controller: _deviceController,
-                      autocorrect: false,
-                      enableSuggestions: false,
-                      textInputAction: TextInputAction.done,
-                      onSubmitted: (_) => _applyDeviceId(),
-                      decoration: InputDecoration(
-                        labelText: 'Device ID',
-                        hintText: 'car1',
-                        prefixIcon: const Icon(
-                          Icons.precision_manufacturing,
-                        ),
-                        suffixIcon: IconButton(
-                          tooltip: 'Apply device ID',
-                          onPressed:
-                              _connecting ? null : _applyDeviceId,
-                          icon: const Icon(Icons.check_circle_outline),
-                        ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.tag,
-                          size: 18,
-                          color: blue,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            _clientId,
-                            style: const TextStyle(
-                              fontSize: 11,
-                              fontFamily: 'monospace',
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        IconButton(
-                          tooltip: 'New client ID',
-                          onPressed: _connecting
-                              ? null
-                              : _newIdAndReconnect,
-                          icon: const Icon(Icons.shuffle),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                'HOLD TO MOVE • RELEASE TO STOP',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: Color(0xFF9EADB8),
-                  letterSpacing: 1.1,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 10),
+              _buildTopBar(),
+              const SizedBox(height: 8),
               Expanded(
                 child: Row(
                   children: [
                     Expanded(
-                      child: ControlPad(
-                        title: 'DRIVE',
+                      child: _JoystickPanel(
+                        title: 'حرکت خودرو',
+                        subtitle: 'بالا/پایین: جلو و عقب  •  چپ/راست: گردش',
                         icon: Icons.directions_car_filled,
-                        accent: gold,
-                        commands: const [
-                          ControlCommand.forward,
-                          ControlCommand.backward,
-                          ControlCommand.left,
-                          ControlCommand.right,
-                        ],
-                        onPress: _press,
-                        onRelease: _release,
-                        activeCommands: _activeTopics.keys.toSet(),
+                        onChanged: _updateDrive,
+                        onReleased: _endDrive,
+                        axisX: 'گردش',
+                        axisY: 'جلو / عقب',
                       ),
                     ),
-                    const SizedBox(width: 10),
+                    const SizedBox(width: 12),
                     Expanded(
-                      child: ControlPad(
-                        title: 'CRANE',
+                      child: _JoystickPanel(
+                        title: 'جرثقیل',
+                        subtitle: 'بالا/پایین: بالابر  •  چپ/راست: چرخش',
                         icon: Icons.precision_manufacturing,
-                        accent: blue,
-                        commands: const [
-                          ControlCommand.craneUp,
-                          ControlCommand.craneDown,
-                          ControlCommand.craneRotateLeft,
-                          ControlCommand.craneRotateRight,
-                        ],
-                        onPress: _press,
-                        onRelease: _release,
-                        activeCommands: _activeTopics.keys.toSet(),
+                        onChanged: _updateCrane,
+                        onReleased: _endCrane,
+                        axisX: 'چرخش',
+                        axisY: 'بالابر',
                       ),
                     ),
                   ],
-                ),
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                height: 48,
-                child: OutlinedButton.icon(
-                  onPressed: _activeTopics.isEmpty
-                      ? null
-                      : _releaseAll,
-                  icon: const Icon(Icons.stop_circle_outlined),
-                  label: const Text('RELEASE ALL CONTROLS'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.redAccent,
-                    side: const BorderSide(
-                      color: Colors.redAccent,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'cranecar/<device-id>/cmd/#',
-                style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 11,
-                  color: Color(0xFF84939E),
                 ),
               ),
             ],
@@ -552,189 +283,264 @@ class _RemoteScreenState extends State<RemoteScreen>
       ),
     );
   }
+
+  Widget _buildTopBar() {
+    final statusColor = _connected
+        ? const Color(0xFF35D07F)
+        : (_connecting ? const Color(0xFFFFC857) : const Color(0xFFFF6673));
+    return Row(
+      children: [
+        const Icon(Icons.settings_remote, color: Color(0xFF17C9B5), size: 25),
+        const SizedBox(width: 8),
+        const Text('کنترل جرثقیل',
+            style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
+        const SizedBox(width: 14),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1A2731),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 7),
+              Text(_connected
+                  ? 'متصل • $_host:$_port'
+                  : (_connecting ? 'در حال اتصال…' : 'قطع • $_host:$_port')),
+            ],
+          ),
+        ),
+        if (_error != null) ...[
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(_error!,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Color(0xFFFF8992), fontSize: 11)),
+          ),
+        ] else
+          const Spacer(),
+        OutlinedButton.icon(
+          onPressed: _connecting ? null : (_connected ? _disconnect : _connect),
+          icon: Icon(_connected ? Icons.link_off : Icons.link),
+          label: Text(_connected ? 'قطع اتصال' : 'اتصال'),
+        ),
+        const SizedBox(width: 8),
+        FilledButton.icon(
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFFB8323C),
+            foregroundColor: Colors.white,
+          ),
+          onPressed: () => _stopAll(sendZeros: true),
+          icon: const Icon(Icons.stop_circle_outlined),
+          label: const Text('توقف اضطراری'),
+        ),
+      ],
+    );
+  }
 }
 
-class ControlPad extends StatelessWidget {
-  const ControlPad({
+class _JoystickPanel extends StatelessWidget {
+  const _JoystickPanel({
     required this.title,
+    required this.subtitle,
     required this.icon,
-    required this.accent,
-    required this.commands,
-    required this.onPress,
-    required this.onRelease,
-    required this.activeCommands,
-    super.key,
+    required this.onChanged,
+    required this.onReleased,
+    required this.axisX,
+    required this.axisY,
   });
 
   final String title;
+  final String subtitle;
   final IconData icon;
-  final Color accent;
-  final List<ControlCommand> commands;
-  final ValueChanged<ControlCommand> onPress;
-  final ValueChanged<ControlCommand> onRelease;
-  final Set<ControlCommand> activeCommands;
-
-  String _label(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward:
-        return 'FORWARD';
-      case ControlCommand.backward:
-        return 'BACKWARD';
-      case ControlCommand.left:
-        return 'LEFT';
-      case ControlCommand.right:
-        return 'RIGHT';
-      case ControlCommand.craneUp:
-        return 'UP';
-      case ControlCommand.craneDown:
-        return 'DOWN';
-      case ControlCommand.craneRotateLeft:
-        return 'ROTATE L';
-      case ControlCommand.craneRotateRight:
-        return 'ROTATE R';
-    }
-  }
-
-  IconData _buttonIcon(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward:
-      case ControlCommand.craneUp:
-        return Icons.arrow_upward;
-      case ControlCommand.backward:
-      case ControlCommand.craneDown:
-        return Icons.arrow_downward;
-      case ControlCommand.left:
-      case ControlCommand.craneRotateLeft:
-        return Icons.arrow_back;
-      case ControlCommand.right:
-      case ControlCommand.craneRotateRight:
-        return Icons.arrow_forward;
-    }
-  }
+  final void Function(double x, double y) onChanged;
+  final VoidCallback onReleased;
+  final String axisX;
+  final String axisY;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(9),
       decoration: BoxDecoration(
-        color: const Color(0xFF151F2A),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: accent.withOpacity(0.3),
-        ),
+        color: const Color(0xFF17232D),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFF273844)),
       ),
+      padding: const EdgeInsets.fromLTRB(12, 9, 12, 8),
       child: Column(
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, color: accent, size: 19),
-              const SizedBox(width: 6),
+              Icon(icon, color: const Color(0xFF17C9B5), size: 20),
+              const SizedBox(width: 7),
+              Text(title,
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+              const Spacer(),
               Flexible(
-                child: Text(
-                  title,
-                  style: TextStyle(
-                    color: accent,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 1,
-                  ),
-                ),
+                child: Text(subtitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.end,
+                    style: const TextStyle(fontSize: 10, color: Colors.white60)),
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 4),
           Expanded(
-            child: GridView.count(
-              physics: const NeverScrollableScrollPhysics(),
-              crossAxisCount: 2,
-              mainAxisSpacing: 9,
-              crossAxisSpacing: 9,
-              childAspectRatio: 0.85,
-              children: commands.map((command) {
-                return _MomentaryButton(
-                  label: _label(command),
-                  icon: _buttonIcon(command),
-                  accent: accent,
-                  active: activeCommands.contains(command),
-                  onDown: () => onPress(command),
-                  onUp: () => onRelease(command),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final side = math.min(constraints.maxWidth, constraints.maxHeight);
+                return Center(
+                  child: SizedBox(
+                    width: side,
+                    height: side,
+                    child: _TouchJoystick(
+                      onChanged: onChanged,
+                      onReleased: onReleased,
+                    ),
+                  ),
                 );
-              }).toList(),
+              },
             ),
           ),
+          Text('$axisY  ↑↓     $axisX  ←→',
+              style: const TextStyle(fontSize: 10, color: Colors.white54)),
         ],
       ),
     );
   }
 }
 
-class _MomentaryButton extends StatelessWidget {
-  const _MomentaryButton({
-    required this.label,
-    required this.icon,
-    required this.accent,
-    required this.active,
-    required this.onDown,
-    required this.onUp,
-  });
+class _TouchJoystick extends StatefulWidget {
+  const _TouchJoystick({required this.onChanged, required this.onReleased});
 
-  final String label;
-  final IconData icon;
-  final Color accent;
-  final bool active;
-  final VoidCallback onDown;
-  final VoidCallback onUp;
+  final void Function(double x, double y) onChanged;
+  final VoidCallback onReleased;
+
+  @override
+  State<_TouchJoystick> createState() => _TouchJoystickState();
+}
+
+class _TouchJoystickState extends State<_TouchJoystick> {
+  int? _activePointer;
+  double _x = 0;
+  double _y = 0;
+
+  void _handleDown(PointerDownEvent event) {
+    // Accept one pointer only; ignore extra fingers to avoid accidental jumps.
+    if (_activePointer != null) return;
+    _activePointer = event.pointer;
+    _updateFromPosition(event.localPosition);
+  }
+
+  void _handleMove(PointerMoveEvent event) {
+    if (event.pointer != _activePointer) return;
+    _updateFromPosition(event.localPosition);
+  }
+
+  void _updateFromPosition(Offset position) {
+    final box = context.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    final size = box.size;
+    final radius = math.min(size.width, size.height) * 0.38;
+    if (radius <= 0) return;
+    var x = (position.dx - size.width / 2) / radius;
+    var y = (size.height / 2 - position.dy) / radius;
+    final magnitude = math.sqrt(x * x + y * y);
+    if (magnitude > 1) {
+      x /= magnitude;
+      y /= magnitude;
+    }
+    setState(() {
+      _x = x;
+      _y = y;
+    });
+    widget.onChanged(x, y);
+  }
+
+  void _finish(int pointer) {
+    if (_activePointer != pointer) return;
+    _activePointer = null;
+    setState(() {
+      _x = 0;
+      _y = 0;
+    });
+    widget.onReleased();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    return Listener(
       behavior: HitTestBehavior.opaque,
-      onTapDown: (_) => onDown(),
-      onTapUp: (_) => onUp(),
-      onTapCancel: onUp,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 100),
-        decoration: BoxDecoration(
-          color: active
-              ? accent.withOpacity(0.22)
-              : const Color(0xFF202E3B),
-          borderRadius: BorderRadius.circular(17),
-          border: Border.all(
-            color: accent.withOpacity(active ? 1 : 0.65),
-            width: active ? 2.5 : 1.4,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: accent.withOpacity(active ? 0.25 : 0.07),
-              blurRadius: active ? 14 : 6,
-            ),
-          ],
-        ),
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(3),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(icon, color: accent, size: 27),
-                const SizedBox(height: 6),
-                FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(
-                    label,
-                    maxLines: 1,
-                    style: const TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 0.3,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
+      onPointerDown: _handleDown,
+      onPointerMove: _handleMove,
+      onPointerUp: (event) => _finish(event.pointer),
+      onPointerCancel: (event) => _finish(event.pointer),
+      child: CustomPaint(
+        painter: _JoystickPainter(x: _x, y: _y),
+        child: const SizedBox.expand(),
       ),
     );
   }
+}
+
+class _JoystickPainter extends CustomPainter {
+  const _JoystickPainter({required this.x, required this.y});
+  final double x;
+  final double y;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = math.min(size.width, size.height) * 0.43;
+    final base = Paint()..color = const Color(0xFF202F3A);
+    final outline = Paint()
+      ..color = const Color(0xFF3B515F)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5;
+    canvas.drawCircle(center, radius, base);
+    canvas.drawCircle(center, radius, outline);
+    final guide = Paint()
+      ..color = const Color(0xFF415461)
+      ..strokeWidth = 1;
+    canvas.drawLine(Offset(center.dx - radius, center.dy),
+        Offset(center.dx + radius, center.dy), guide);
+    canvas.drawLine(Offset(center.dx, center.dy - radius),
+        Offset(center.dx, center.dy + radius), guide);
+    canvas.drawCircle(center, radius * 0.52, outline);
+
+    final travel = radius * 0.62;
+    final knobCenter = Offset(center.dx + x * travel, center.dy - y * travel);
+    canvas.drawCircle(
+      knobCenter.translate(0, 3),
+      radius * 0.28,
+      Paint()..color = Colors.black.withValues(alpha: 0.25),
+    );
+    final knobPaint = Paint()
+      ..shader = const LinearGradient(
+        colors: [Color(0xFF32E0CB), Color(0xFF079B91)],
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+      ).createShader(Rect.fromCircle(center: knobCenter, radius: radius * 0.27));
+    canvas.drawCircle(knobCenter, radius * 0.27, knobPaint);
+    canvas.drawCircle(
+      knobCenter,
+      radius * 0.27,
+      Paint()
+        ..color = const Color(0xFF8AFFF0)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _JoystickPainter oldDelegate) =>
+      oldDelegate.x != x || oldDelegate.y != y;
 }
