@@ -1,729 +1,530 @@
-
-import 'dart:async';
-import 'dart:math';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 
-enum ControlCommand {
-  forward,
-  backward,
-  left,
-  right,
-  craneUp,
-  craneDown,
-  craneRotateLeft,
-  craneRotateRight,
-}
-
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const CraneRemoteApp());
+  await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
+  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  runApp(const MaterialApp(
+    debugShowCheckedModeBanner: false,
+    home: RealisticPS5CraneScreen(),
+  ));
 }
 
-class CraneRemoteApp extends StatelessWidget {
-  const CraneRemoteApp({super.key});
+class RealisticPS5CraneScreen extends StatefulWidget {
+  const RealisticPS5CraneScreen({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    const gold = Color(0xFFFFB300);
-
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Crane Remote',
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.dark,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: gold,
-          brightness: Brightness.dark,
-        ),
-        scaffoldBackgroundColor: const Color(0xFF0B1118),
-        cardColor: const Color(0xFF151F2A),
-      ),
-      home: const RemoteScreen(),
-    );
-  }
+  State<RealisticPS5CraneScreen> createState() => _RealisticPS5CraneScreenState();
 }
 
-class RemoteScreen extends StatefulWidget {
-  const RemoteScreen({super.key});
-
-  @override
-  State<RemoteScreen> createState() => _RemoteScreenState();
-}
-
-class _RemoteScreenState extends State<RemoteScreen>
+class _RealisticPS5CraneScreenState extends State<RealisticPS5CraneScreen>
     with WidgetsBindingObserver {
   static const String _broker = 'broker.hivemq.com';
   static const int _port = 8883;
+  static const String _deviceId = 'car1';
+  static const List<String> _commands = <String>[
+    'forward', 'backward', 'left', 'right', 'up', 'down', 'rot_left', 'rot_right',
+  ];
 
-  final _deviceController = TextEditingController(text: 'car1');
-
-  late String _clientId;
   MqttServerClient? _client;
-  Timer? _retryTimer;
-
-  bool _connected = false;
-  bool _connecting = false;
-  bool _disposed = false;
-
-  final Map<ControlCommand, String> _activeTopics = {};
+  bool _isConnected = false;
+  bool _isConnecting = false;
+  int _connectionGeneration = 0;
+  // هر pointer مالک یک فرمان؛ چند انگشت روی یک دکمه، صفر را زودهنگام نمی‌فرستند.
+  final Map<int, String> _activePointers = <int, String>{};
+  final Map<String, Set<int>> _commandPointers = <String, Set<int>>{};
+  static const Map<String, String> _opposites = <String, String>{
+    'forward': 'backward', 'backward': 'forward', 'left': 'right', 'right': 'left',
+    'up': 'down', 'down': 'up', 'rot_left': 'rot_right', 'rot_right': 'rot_left',
+  };
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-
-    _clientId = _newClientId();
-    _connect();
-
-    _retryTimer = Timer.periodic(
-      const Duration(seconds: 15),
-      (_) {
-        if (!_connected && !_connecting && !_disposed) {
-          _connect();
-        }
-      },
-    );
   }
 
-  String _newClientId() =>
-      'crane_${Random.secure().nextInt(1 << 32).toRadixString(16)}';
+  bool get _canPublish =>
+      mounted &&
+      _isConnected &&
+      _client?.connectionStatus?.state == MqttConnectionState.connected;
 
-  String _commandName(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward:
-        return 'forward';
-      case ControlCommand.backward:
-        return 'backward';
-      case ControlCommand.left:
-        return 'left';
-      case ControlCommand.right:
-        return 'right';
-      case ControlCommand.craneUp:
-        return 'crane_up';
-      case ControlCommand.craneDown:
-        return 'crane_down';
-      case ControlCommand.craneRotateLeft:
-        return 'crane_rotate_left';
-      case ControlCommand.craneRotateRight:
-        return 'crane_rotate_right';
-    }
-  }
-
-  String _topic(ControlCommand c) {
-    final id = _deviceController.text.trim();
-
-    if (id.isEmpty || id.contains('/')) {
-      throw ArgumentError('Device ID is invalid');
-    }
-
-    return 'cranecar/$id/cmd/${_commandName(c)}';
-  }
-
-  Future<void> _connect() async {
-    if (_connecting || _disposed) return;
-
-    _connecting = true;
-    if (mounted) setState(() {});
-
-    final previous = _client;
-    _client = null;
-    previous?.disconnect();
-
-    final client = MqttServerClient.withPort(
-      _broker,
-      _clientId,
-      _port,
-    );
-
-    client.secure = true;
-    client.keepAlivePeriod = 30;
-    client.connectTimeoutPeriod = 8000;
-    client.logging(on: false);
-
-    client.onConnected = () {
-      if (_disposed || !identical(_client, client)) return;
-
-      if (mounted) {
-        setState(() {
-          _connected = true;
-          _connecting = false;
-        });
-      }
-    };
-
-    client.onDisconnected = () {
-      if (_disposed || !identical(_client, client)) return;
-
-      _activeTopics.clear();
-
-      if (mounted) {
-        setState(() {
-          _connected = false;
-          _connecting = false;
-        });
-      }
-    };
-
-    client.connectionMessage = MqttConnectMessage()
-        .withClientIdentifier(_clientId)
-        .startClean()
-        .withWillQos(MqttQos.atMostOnce);
-
-    _client = client;
-
-    try {
-      final status = await client.connect();
-
-      if (_disposed || !identical(_client, client)) return;
-
-      final success =
-          status?.state == MqttConnectionState.connected;
-
-      if (!success) {
-        client.disconnect();
-      }
-
-      if (mounted) {
-        setState(() {
-          _connected = success;
-          _connecting = false;
-        });
-      }
-    } catch (_) {
-      client.disconnect();
-
-      if (_disposed || !identical(_client, client)) return;
-
-      if (mounted) {
-        setState(() {
-          _connected = false;
-          _connecting = false;
-        });
-      }
-    }
-  }
-
-  bool _publish(String topic, String value) {
-    final client = _client;
-
-    if (!_connected ||
-        client == null ||
-        client.connectionStatus?.state !=
-            MqttConnectionState.connected) {
-      return false;
-    }
-
-    try {
-      final builder = MqttClientPayloadBuilder()
-        ..addString(value);
-
-      final payload = builder.payload;
-      if (payload == null) return false;
-
-      client.publishMessage(
-        topic,
-        MqttQos.atMostOnce,
-        payload,
-        retain: false,
-      );
-
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  void _press(ControlCommand command) {
-    if (!_connected || _activeTopics.containsKey(command)) {
-      return;
-    }
-
-    try {
-      final topic = _topic(command);
-
-      if (_publish(topic, '1')) {
-        _activeTopics[command] = topic;
-        HapticFeedback.selectionClick();
-        if (mounted) setState(() {});
-      }
-    } catch (_) {
-      _showMessage('شناسه دستگاه معتبر نیست.');
-    }
-  }
-
-  void _release(ControlCommand command) {
-    final topic = _activeTopics.remove(command);
-    if (topic == null) return;
-
-    _publish(topic, '0');
-
-    if (mounted) setState(() {});
-  }
-
-  void _releaseAll() {
-    final topics = _activeTopics.values.toList();
-    _activeTopics.clear();
-
-    for (final topic in topics) {
-      _publish(topic, '0');
-    }
-
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _reconnect() async {
-    if (_connecting || _disposed) return;
-
-    _releaseAll();
-
-    final old = _client;
-    _client = null;
-    _connected = false;
-    _connecting = false;
-
-    old?.disconnect();
-
-    await _connect();
-  }
-
-  Future<void> _applyDeviceId() async {
-    final id = _deviceController.text.trim();
-
-    if (id.isEmpty || id.contains('/')) {
-      _showMessage('شناسه دستگاه معتبر نیست.');
-      return;
-    }
-
-    await _reconnect();
-  }
-
-  Future<void> _newIdAndReconnect() async {
-    if (_connecting) return;
-
-    _clientId = _newClientId();
-    if (mounted) setState(() {});
-
-    await _reconnect();
+  void _updateState(VoidCallback fn) {
+    if (mounted) setState(fn);
   }
 
   void _showMessage(String message) {
     if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message), duration: const Duration(seconds: 3)));
+  }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
+  Future<void> _toggleConnection() async {
+    if (_isConnecting) {
+      // لغو منطقی تلاش؛ callbackهای تلاش قدیمی با generation بی‌اعتبار می‌شوند.
+      ++_connectionGeneration;
+      final oldClient = _client;
+      _client = null;
+      _updateState(() {
+        _isConnecting = false;
+        _isConnected = false;
+      });
+      try {
+        oldClient?.disconnect();
+      } catch (_) {}
+      _releasePressedLocally();
+      return;
+    }
+
+    if (_isConnected) {
+      await _disconnectByUser();
+      return;
+    }
+    await _connect();
+  }
+
+  Future<void> _connect() async {
+    final int generation = ++_connectionGeneration;
+    final String clientId =
+        'ps5_crane_${DateTime.now().microsecondsSinceEpoch}_${math.Random().nextInt(1 << 20)}';
+    final MqttServerClient candidate = MqttServerClient.withPort(
+      _broker,
+      clientId,
+      _port,
+    )
+      ..secure = true
+      ..loggingOn = false
+      ..keepAlivePeriod = 30
+      ..connectTimeoutPeriod = 10000
+      ..autoReconnect = false;
+
+    _client = candidate;
+    _updateState(() {
+      _isConnecting = true;
+      _isConnected = false;
+    });
+
+    candidate.onConnected = () {
+      if (!mounted || generation != _connectionGeneration || !identical(_client, candidate)) return;
+      _updateState(() {
+        _isConnected = true;
+        _isConnecting = false;
+      });
+    };
+    candidate.onDisconnected = () {
+      if (!mounted || generation != _connectionGeneration || !identical(_client, candidate)) return;
+      _releasePressedLocally();
+      _updateState(() {
+        _isConnected = false;
+        _isConnecting = false;
+      });
+    };
+
+    try {
+      final MqttClientConnectionStatus? status = await candidate.connect();
+      if (!mounted || generation != _connectionGeneration || !identical(_client, candidate)) {
+        candidate.disconnect();
+        return;
+      }
+      final bool connected =
+          status?.state == MqttConnectionState.connected &&
+          candidate.connectionStatus?.state == MqttConnectionState.connected;
+      if (!connected) {
+        candidate.disconnect();
+        _updateState(() {
+          _isConnected = false;
+          _isConnecting = false;
+        });
+        _showMessage('اتصال MQTT برقرار نشد. وضعیت: ${status?.state ?? 'نامشخص'}');
+      } else {
+        _updateState(() {
+          _isConnected = true;
+          _isConnecting = false;
+        });
+      }
+    } catch (error) {
+      if (generation == _connectionGeneration && identical(_client, candidate)) {
+        try {
+          candidate.disconnect();
+        } catch (_) {}
+        _client = null;
+        _updateState(() {
+          _isConnected = false;
+          _isConnecting = false;
+        });
+        _releasePressedLocally();
+        _showMessage('خطا در اتصال MQTT: $error');
+      }
+    }
+  }
+
+  Future<void> _disconnectByUser() async {
+    final MqttServerClient? oldClient = _client;
+    // ابتدا تا وقتی سوکت قابل استفاده است دستور توقف ارسال می‌شود.
+    _stopAll(sendWhenConnected: true);
+    ++_connectionGeneration;
+    _client = null;
+    _updateState(() {
+      _isConnected = false;
+      _isConnecting = false;
+    });
+    try {
+      oldClient?.disconnect();
+    } catch (error) {
+      _showMessage('خطا هنگام قطع اتصال: $error');
+    }
+  }
+
+  /// فقط در حالت اتصال واقعی publish می‌کند؛ بعد از قطع هیچ فرمانی صف نمی‌شود.
+  bool _send(String command, String value) {
+    if (!_commands.contains(command) || !_canPublish) return false;
+    final MqttServerClient? current = _client;
+    if (current == null) return false;
+    try {
+      final MqttClientPayloadBuilder builder = MqttClientPayloadBuilder()..addString(value);
+      final payload = builder.payload;
+      if (payload == null || payload.isEmpty) return false;
+      // بررسی دوباره درست پیش از publish برای جلوگیری از ارسال روی session منقضی.
+      if (!identical(current, _client) || !_canPublish) return false;
+      current.publishMessage(
+        'cranecar/$_deviceId/cmd/$command',
+        MqttQos.atMostOnce,
+        payload,
+      );
+      return true;
+    } catch (error) {
+      // session معیوب را قبل از قطع invalidate می‌کنیم تا callback قدیمی UI را تغییر ندهد.
+      ++_connectionGeneration;
+      final MqttServerClient? failedClient = _client;
+      _client = null;
+      _releasePressedLocally();
+      _updateState(() {
+        _isConnected = false;
+        _isConnecting = false;
+      });
+      try {
+        failedClient?.disconnect();
+      } catch (_) {}
+      _showMessage('ارسال فرمان ناموفق بود: $error');
+      return false;
+    }
+  }
+
+  bool _press(String command, int pointer) {
+    if (!_commands.contains(command) || _activePointers.containsKey(pointer)) return false;
+    final Set<int>? owners = _commandPointers[command];
+    if (owners == null) {
+      // از صدور دو جهت مخالف برای یک محور هم‌زمان جلوگیری می‌شود.
+      if (_commandPointers.containsKey(_opposites[command])) return false;
+      if (!_send(command, '1')) return false;
+      _commandPointers[command] = <int>{pointer};
+      HapticFeedback.lightImpact();
+    } else {
+      owners.add(pointer);
+    }
+    _activePointers[pointer] = command;
+    return true;
+  }
+
+  void _releasePointer(int pointer) {
+    final String? command = _activePointers.remove(pointer);
+    if (command == null) return;
+    final Set<int>? owners = _commandPointers[command];
+    if (owners == null) return;
+    owners.remove(pointer);
+    if (owners.isEmpty) {
+      _commandPointers.remove(command);
+      _send(command, '0');
+    }
+  }
+
+  void _releasePressedLocally() {
+    // در قطع اتصال، صفر قابل ارسال نیست؛ مالکیت pointerها نیز باید پاک شود.
+    _activePointers.clear();
+    _commandPointers.clear();
+  }
+
+  void _stopAll({bool sendWhenConnected = true}) {
+    _releasePressedLocally();
+    if (sendWhenConnected && _canPublish) {
+      // همه فرمان‌ها صفر می‌شوند، نه فقط مواردی که UI آن‌ها را pressed ثبت کرده.
+      for (final String command in _commands) {
+        _send(command, '0');
+      }
+    }
+    HapticFeedback.heavyImpact();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0D0E12),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (BuildContext context, BoxConstraints constraints) {
+            final double width = constraints.maxWidth;
+            final double height = constraints.maxHeight;
+            final double scale = (math.min(width / 700, height / 360)).clamp(0.65, 1.2).toDouble();
+            return Center(
+              child: SizedBox(
+                width: width * 0.98,
+                height: height * 0.98,
+                child: LayoutBuilder(
+                  builder: (BuildContext context, BoxConstraints box) {
+                    final double w = box.maxWidth;
+                    final double h = box.maxHeight;
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: <Widget>[
+                        CustomPaint(painter: PS5BodyPainter(isConnected: _isConnected)),
+                        Align(
+                          alignment: Alignment.topCenter,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: _toggleConnection,
+                            child: Container(
+                              margin: EdgeInsets.only(top: 8 * scale),
+                              width: 200 * scale,
+                              height: 80 * scale,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1B1D24),
+                                borderRadius: const BorderRadius.vertical(
+                                  bottom: Radius.circular(20), top: Radius.circular(8),
+                                ),
+                                border: Border.all(
+                                  color: _isConnected ? Colors.cyanAccent : const Color(0xFF3B404D),
+                                  width: 2,
+                                ),
+                                boxShadow: _isConnected
+                                    ? <BoxShadow>[BoxShadow(color: Colors.cyanAccent.withOpacity(0.4), blurRadius: 12)]
+                                    : const <BoxShadow>[],
+                              ),
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: <Widget>[
+                                  Icon(_isConnected ? Icons.power : Icons.power_off,
+                                      color: _isConnected ? Colors.cyanAccent : Colors.white38, size: 26 * scale),
+                                  SizedBox(height: 4 * scale),
+                                  Text(
+                                    _isConnected ? 'CONNECTED ($_deviceId)' : _isConnecting ? 'CONNECTING...' : 'TOUCH TO CONNECT',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: _isConnected ? Colors.cyanAccent : Colors.white60,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 10 * scale,
+                                      letterSpacing: 1,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          bottom: 12 * scale,
+                          left: 0,
+                          right: 0,
+                          child: Center(
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: _stopAll,
+                              child: Container(
+                                width: 50 * scale,
+                                height: 50 * scale,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: const Color(0xFF14161C),
+                                  border: Border.all(color: Colors.redAccent.withOpacity(0.8), width: 2),
+                                  boxShadow: const <BoxShadow>[BoxShadow(color: Colors.black87, blurRadius: 8, offset: Offset(0, 4))],
+                                ),
+                                child: Center(child: Text('STOP', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w900, fontSize: 10 * scale))),
+                              ),
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          left: math.max(8.0, w * 0.07).toDouble(),
+                          top: 0,
+                          bottom: 10 * scale,
+                          child: Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: <Widget>[
+                                Text('DRIVE CAR', style: TextStyle(color: Colors.white70, fontSize: 11 * scale, fontWeight: FontWeight.bold)),
+                                SizedBox(height: 8 * scale),
+                                _dpadBtn(Icons.keyboard_arrow_up, 'forward', 'جلو', scale),
+                                Row(children: <Widget>[
+                                  _dpadBtn(Icons.keyboard_arrow_left, 'left', 'چپ', scale),
+                                  SizedBox(width: 38 * scale),
+                                  _dpadBtn(Icons.keyboard_arrow_right, 'right', 'راست', scale),
+                                ]),
+                                _dpadBtn(Icons.keyboard_arrow_down, 'backward', 'عقب', scale),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          right: math.max(8.0, w * 0.07).toDouble(),
+                          top: 0,
+                          bottom: 10 * scale,
+                          child: Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: <Widget>[
+                                Text('CRANE', style: TextStyle(color: Colors.amberAccent, fontSize: 11 * scale, fontWeight: FontWeight.bold)),
+                                SizedBox(height: 8 * scale),
+                                _psActionBtn('▲', Colors.greenAccent, 'up', 'بالا', scale),
+                                Row(children: <Widget>[
+                                  _psActionBtn('■', Colors.pinkAccent, 'rot_left', 'چپ', scale),
+                                  SizedBox(width: 38 * scale),
+                                  _psActionBtn('●', Colors.redAccent, 'rot_right', 'راست', scale),
+                                ]),
+                                _psActionBtn('✖', Colors.lightBlueAccent, 'down', 'پایین', scale),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            );
+          },
+        ),
       ),
     );
   }
 
+  Widget _dpadBtn(IconData icon, String command, String label, double scale) {
+    return _HoldCommandButton(
+      onPress: (int pointer) => _press(command, pointer),
+      onRelease: _releasePointer,
+      child: Container(
+        margin: EdgeInsets.all(4 * scale),
+        width: 48 * scale,
+        height: 48 * scale,
+        decoration: BoxDecoration(
+          color: const Color(0xFF2A2E3B),
+          borderRadius: BorderRadius.circular(10 * scale),
+          border: Border.all(color: const Color(0xFF4A5163)),
+          boxShadow: const <BoxShadow>[BoxShadow(color: Colors.black54, blurRadius: 4, offset: Offset(0, 3))],
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Icon(icon, color: Colors.white, size: 20 * scale),
+            Text(label, style: TextStyle(color: Colors.white54, fontSize: 8 * scale)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _psActionBtn(String symbol, Color color, String command, String label, double scale) {
+    return _HoldCommandButton(
+      onPress: (int pointer) => _press(command, pointer),
+      onRelease: _releasePointer,
+      child: Container(
+        margin: EdgeInsets.all(4 * scale),
+        width: 48 * scale,
+        height: 48 * scale,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: const Color(0xFF2A2E3B),
+          border: Border.all(color: color.withOpacity(0.8), width: 2),
+          boxShadow: <BoxShadow>[
+            BoxShadow(color: color.withOpacity(0.2), blurRadius: 6),
+            const BoxShadow(color: Colors.black54, blurRadius: 4, offset: Offset(0, 3)),
+          ],
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Text(symbol, style: TextStyle(color: color, fontSize: 15 * scale, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(color: color.withOpacity(0.8), fontSize: 8 * scale)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// دکمهٔ نگه‌داشتنی با مالکیت مستقل برای هر pointer و لغو هنگام خروج از محدوده.
+class _HoldCommandButton extends StatefulWidget {
+  const _HoldCommandButton({
+    required this.onPress,
+    required this.onRelease,
+    required this.child,
+  });
+
+  final bool Function(int pointer) onPress;
+  final void Function(int pointer) onRelease;
+  final Widget child;
+
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) {
-      _releaseAll();
-    }
+  State<_HoldCommandButton> createState() => _HoldCommandButtonState();
+}
+
+class _HoldCommandButtonState extends State<_HoldCommandButton> {
+  final Set<int> _pointers = <int>{};
+
+  void _release(int pointer) {
+    if (_pointers.remove(pointer)) widget.onRelease(pointer);
   }
 
   @override
   void dispose() {
-    _disposed = true;
-    WidgetsBinding.instance.removeObserver(this);
-    _retryTimer?.cancel();
-
-    for (final topic in _activeTopics.values.toList()) {
-      _publish(topic, '0');
+    for (final int pointer in _pointers.toList()) {
+      widget.onRelease(pointer);
     }
-
-    _activeTopics.clear();
-    _client?.disconnect();
-    _deviceController.dispose();
-
+    _pointers.clear();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    const gold = Color(0xFFFFB300);
-    const blue = Color(0xFF40C4FF);
-
-    final statusColor = _connected
-        ? const Color(0xFF35D07F)
-        : const Color(0xFFFF5D5D);
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'CRANE / CAR',
-          style: TextStyle(
-            fontWeight: FontWeight.w900,
-            letterSpacing: 2,
-          ),
-        ),
-        centerTitle: true,
-        actions: [
-          IconButton(
-            tooltip: 'Reconnect',
-            onPressed: _connecting ? null : _reconnect,
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            children: [
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF151F2A),
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(
-                    color: statusColor.withOpacity(0.5),
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.circle,
-                          size: 12,
-                          color: statusColor,
-                        ),
-                        const SizedBox(width: 9),
-                        Expanded(
-                          child: Text(
-                            _connected
-                                ? 'MQTT CONNECTED'
-                                : _connecting
-                                    ? 'CONNECTING...'
-                                    : 'DISCONNECTED',
-                            style: TextStyle(
-                              color: statusColor,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                        const Icon(Icons.wifi, color: gold),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-                    TextField(
-                      controller: _deviceController,
-                      autocorrect: false,
-                      enableSuggestions: false,
-                      textInputAction: TextInputAction.done,
-                      onSubmitted: (_) => _applyDeviceId(),
-                      decoration: InputDecoration(
-                        labelText: 'Device ID',
-                        hintText: 'car1',
-                        prefixIcon: const Icon(
-                          Icons.precision_manufacturing,
-                        ),
-                        suffixIcon: IconButton(
-                          tooltip: 'Apply device ID',
-                          onPressed:
-                              _connecting ? null : _applyDeviceId,
-                          icon: const Icon(Icons.check_circle_outline),
-                        ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.tag,
-                          size: 18,
-                          color: blue,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            _clientId,
-                            style: const TextStyle(
-                              fontSize: 11,
-                              fontFamily: 'monospace',
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        IconButton(
-                          tooltip: 'New client ID',
-                          onPressed: _connecting
-                              ? null
-                              : _newIdAndReconnect,
-                          icon: const Icon(Icons.shuffle),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                'HOLD TO MOVE • RELEASE TO STOP',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: Color(0xFF9EADB8),
-                  letterSpacing: 1.1,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 10),
-              Expanded(
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: ControlPad(
-                        title: 'DRIVE',
-                        icon: Icons.directions_car_filled,
-                        accent: gold,
-                        commands: const [
-                          ControlCommand.forward,
-                          ControlCommand.backward,
-                          ControlCommand.left,
-                          ControlCommand.right,
-                        ],
-                        onPress: _press,
-                        onRelease: _release,
-                        activeCommands: _activeTopics.keys.toSet(),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: ControlPad(
-                        title: 'CRANE',
-                        icon: Icons.precision_manufacturing,
-                        accent: blue,
-                        commands: const [
-                          ControlCommand.craneUp,
-                          ControlCommand.craneDown,
-                          ControlCommand.craneRotateLeft,
-                          ControlCommand.craneRotateRight,
-                        ],
-                        onPress: _press,
-                        onRelease: _release,
-                        activeCommands: _activeTopics.keys.toSet(),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                height: 48,
-                child: OutlinedButton.icon(
-                  onPressed: _activeTopics.isEmpty
-                      ? null
-                      : _releaseAll,
-                  icon: const Icon(Icons.stop_circle_outlined),
-                  label: const Text('RELEASE ALL CONTROLS'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.redAccent,
-                    side: const BorderSide(
-                      color: Colors.redAccent,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'cranecar/<device-id>/cmd/#',
-                style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 11,
-                  color: Color(0xFF84939E),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class ControlPad extends StatelessWidget {
-  const ControlPad({
-    required this.title,
-    required this.icon,
-    required this.accent,
-    required this.commands,
-    required this.onPress,
-    required this.onRelease,
-    required this.activeCommands,
-    super.key,
-  });
-
-  final String title;
-  final IconData icon;
-  final Color accent;
-  final List<ControlCommand> commands;
-  final ValueChanged<ControlCommand> onPress;
-  final ValueChanged<ControlCommand> onRelease;
-  final Set<ControlCommand> activeCommands;
-
-  String _label(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward:
-        return 'FORWARD';
-      case ControlCommand.backward:
-        return 'BACKWARD';
-      case ControlCommand.left:
-        return 'LEFT';
-      case ControlCommand.right:
-        return 'RIGHT';
-      case ControlCommand.craneUp:
-        return 'UP';
-      case ControlCommand.craneDown:
-        return 'DOWN';
-      case ControlCommand.craneRotateLeft:
-        return 'ROTATE L';
-      case ControlCommand.craneRotateRight:
-        return 'ROTATE R';
-    }
-  }
-
-  IconData _buttonIcon(ControlCommand c) {
-    switch (c) {
-      case ControlCommand.forward:
-      case ControlCommand.craneUp:
-        return Icons.arrow_upward;
-      case ControlCommand.backward:
-      case ControlCommand.craneDown:
-        return Icons.arrow_downward;
-      case ControlCommand.left:
-      case ControlCommand.craneRotateLeft:
-        return Icons.arrow_back;
-      case ControlCommand.right:
-      case ControlCommand.craneRotateRight:
-        return Icons.arrow_forward;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(9),
-      decoration: BoxDecoration(
-        color: const Color(0xFF151F2A),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: accent.withOpacity(0.3),
-        ),
-      ),
-      child: Column(
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, color: accent, size: 19),
-              const SizedBox(width: 6),
-              Flexible(
-                child: Text(
-                  title,
-                  style: TextStyle(
-                    color: accent,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 1,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Expanded(
-            child: GridView.count(
-              physics: const NeverScrollableScrollPhysics(),
-              crossAxisCount: 2,
-              mainAxisSpacing: 9,
-              crossAxisSpacing: 9,
-              childAspectRatio: 0.85,
-              children: commands.map((command) {
-                return _MomentaryButton(
-                  label: _label(command),
-                  icon: _buttonIcon(command),
-                  accent: accent,
-                  active: activeCommands.contains(command),
-                  onDown: () => onPress(command),
-                  onUp: () => onRelease(command),
-                );
-              }).toList(),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _MomentaryButton extends StatelessWidget {
-  const _MomentaryButton({
-    required this.label,
-    required this.icon,
-    required this.accent,
-    required this.active,
-    required this.onDown,
-    required this.onUp,
-  });
-
-  final String label;
-  final IconData icon;
-  final Color accent;
-  final bool active;
-  final VoidCallback onDown;
-  final VoidCallback onUp;
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
+    return Listener(
       behavior: HitTestBehavior.opaque,
-      onTapDown: (_) => onDown(),
-      onTapUp: (_) => onUp(),
-      onTapCancel: onUp,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 100),
-        decoration: BoxDecoration(
-          color: active
-              ? accent.withOpacity(0.22)
-              : const Color(0xFF202E3B),
-          borderRadius: BorderRadius.circular(17),
-          border: Border.all(
-            color: accent.withOpacity(active ? 1 : 0.65),
-            width: active ? 2.5 : 1.4,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: accent.withOpacity(active ? 0.25 : 0.07),
-              blurRadius: active ? 14 : 6,
-            ),
-          ],
-        ),
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(3),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(icon, color: accent, size: 27),
-                const SizedBox(height: 6),
-                FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(
-                    label,
-                    maxLines: 1,
-                    style: const TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.w900,
-                      
+      onPointerDown: (PointerDownEvent event) {
+        if (widget.onPress(event.pointer)) _pointers.add(event.pointer);
+      },
+      onPointerMove: (PointerMoveEvent event) {
+        final RenderObject? object = context.findRenderObject();
+        if (object is RenderBox && _pointers.contains(event.pointer)) {
+          final Offset p = event.localPosition;
+          final Rect bounds = Offset.zero & object.size;
+          if (!bounds.contains(p)) _release(event.pointer);
+        }
+      },
+      onPointerUp: (PointerUpEvent event) => _release(event.pointer),
+      onPointerCancel: (PointerCancelEvent event) => _release(event.pointer),
+      child: widget.child,
+    );
+  }
+}
+
+class PS5BodyPainter extends CustomPainter {
+  const PS5BodyPainter({required this.isConnected});
+
+  final bool isConnected;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final double w = size.width;
+    final double h = size.height;
+    final Paint whitePaint = Paint()..color = const Color(0xFFE5E9F0);
+    final Paint darkCenterPaint = Paint()..color = const Color(0xFF14161C);
+    final Path body = Path()
+      ..moveTo(w * 0.18, 0)
+      ..lineTo(w * 0.82, 0)
+      ..quadraticBezierTo(w * 0.98, h * 0.15, w * 0.94, h * 0.85)
